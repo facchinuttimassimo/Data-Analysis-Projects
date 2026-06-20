@@ -1,0 +1,197 @@
+---
+title: "Wage Analysis"
+author: "Massimo Facchinutti"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+## Introduction
+
+This report analyzes wage data from the 1985 Current Population Survey (CPS), available in the `AER` package. The dataset contains information on wages, education, experience, gender, and other individual characteristics. The goal is to explore the main patterns in the data and estimate a regression model of wages.
+
+## Setup
+
+We load the required packages and the dataset.
+
+```{r setup, include=FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(AER)
+library(broom)
+library(knitr)
+
+data("CPS1985")
+data <- CPS1985
+```
+
+## Exploratory Data Analysis
+
+Before modeling, we take a first look at the data to understand its structure, check for missing values, and get a sense of the main variables.
+
+```{r}
+glimpse(data)
+summary(data)
+```
+
+## Visualizations
+
+### Wage Distribution
+
+Wages are likely right-skewed, meaning most workers earn moderate wages while a few earn much higher. We plot the raw distribution and the log-transformed one, which is more suitable for regression.
+
+```{r}
+p1 <- ggplot(data, aes(x = wage)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "steelblue", color = "white") +
+  geom_density(color = "darkblue", linewidth = 1) +
+  labs(title = "Wage Distribution", x = "Wage", y = "Density")
+
+p2 <- ggplot(data, aes(x = log(wage))) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30, fill = "darkorange", color = "white") +
+  geom_density(color = "darkred", linewidth = 1) +
+  labs(title = "Log-Wage Distribution", x = "Log Wage", y = "Density")
+
+p1
+p2
+```
+
+### Correlation
+
+We explore how wages relate to education and experience using scatterplots. A smoothing line helps identify the general trend.
+
+```{r}
+ggplot(data, aes(x = education, y = wage)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", color = "darkblue", se = TRUE) +
+  labs(title = "Wage vs Education", x = "Years of Education", y = "Wage")
+
+ggplot(data, aes(x = experience, y = wage)) +
+  geom_point(alpha = 0.3, color = "darkorange") +
+  geom_smooth(method = "loess", color = "darkred", se = TRUE) +
+  labs(title = "Wage vs Experience", x = "Years of Experience", y = "Wage")
+```
+
+We use a trellis scatterplot to explore how the relationship between wages and education differs across ethnicity and gender groups.
+
+```{r}
+library(lattice)
+xyplot(log(wage) ~ experience | gender , data, type = c("p", "smooth"))
+```
+
+## Regression Model
+
+We estimate a log-linear model where the dependent variable is the natural log of wages. This means that coefficients can be interpreted as approximate percentage changes in wages. We include education, experience, gender, union membership, and ethnicity as predictors.
+
+```{r}
+fit <- lm(log(wage) ~ education + experience + gender + union + ethnicity,
+          data = data)
+summary(fit)
+```
+
+The model explains about 30% of the variance in log wages (R² = 0.30), which is reasonable for a simple cross-sectional wage equation.
+
+Key findings:
+
+- **Education**: each additional year of education increases wages by approximately 9.5%, holding everything else constant. 
+
+- **Experience**: each additional year of experience increases wages by about 1.2%. The effect is smaller than education but still highly significant.
+
+- **Gender**: female workers earn on average about 23% less than male workers, after controlling for education, experience, union, and ethnicity. 
+
+- **Union**: union members earn approximately 22% more than non-union workers.
+
+We add an interaction between experience and gender to test whether the return to experience differs between male and female workers, as suggested by the trellis plot.
+
+```{r}
+fit2 <- lm(log(wage) ~ education + experience * gender + union + ethnicity,
+           data = data)
+summary(fit2)
+```
+
+Adding the interaction term slightly improves the model (R² goes from 0.299 to 0.307). The interaction term `experience:genderfemale` is statistically significant (p = 0.014), confirming what the trellis plot suggested.
+
+Consider now the inclusion a squared experience term to capture the concavity of the experience-wage profile: wages grow with experience, but at a decreasing rate. We add this term to our previous model while keeping the interaction between experience and gender.
+
+```{r}
+data <- data %>%
+  mutate(experience2 = experience^2)
+
+fit3 <- lm(log(wage) ~ education + experience + experience2 + experience * gender + union + ethnicity,
+           data = data)
+summary(fit3)
+```
+
+Adding the squared experience term improves the model further (R² = 0.331). All key results hold.
+
+We formally compare the three models using AIC and BIC. Lower values indicate a better trade-off between fit and complexity.
+
+```{r}
+data.frame(
+  Model = c("fit", "fit2", "fit3"),
+  AIC = round(AIC(fit, fit2, fit3)$AIC, 2),
+  BIC = round(BIC(fit, fit2, fit3)$BIC, 2),
+  R2 = round(c(summary(fit)$r.squared,
+               summary(fit2)$r.squared,
+               summary(fit3)$r.squared), 4)
+) %>%
+  kable(caption = "Model Comparison")
+```
+
+Both AIC and BIC agree: *fit3* is the best model. It achieves the lowest values on both criteria, meaning it improves fit without over-penalizing for complexity. The progression is clear across all three metrics:
+
+- AIC drops from 658 to 636, a meaningful improvement
+- BIC drops from 693 to 680, confirming the gain is not just due to added parameters
+- $R^2$ increases from 0.299 to 0.331
+
+We proceed with **fit3** as our preferred specification for diagnostics and interpretation.
+
+Before drawing conclusions from fit3, we check whether the standard OLS assumptions hold: normality of residuals, homoscedasticity, and absence of highly influential observations.
+
+```{r, fig.height=6}
+par(mfrow = c(2, 2))
+plot(fit3)
+```
+
+Overall, the model assumptions are reasonably satisfied. The residuals show no systematic pattern against fitted values, confirming linearity. The Q-Q plot reveals slight heavy tails, which is common with wage data. The Scale-Location plot suggests mild heteroscedasticity, meaning the variance of residuals increases slightly with fitted values. No observation exceeds Cook's distance threshold, so influential points are not a concern. As a robustness check, robust standard errors could be used to address the mild heteroscedasticity.
+
+## Conclusions
+
+This report analyzed wage determinants using the CPS1985 dataset, combining exploratory analysis and regression modeling. The main findings are:
+
+- **Education** is the strongest predictor of wages: each additional year increases wages by approximately 9%.
+- **Experience** has a concave effect on wages: returns are positive but decreasing over time.
+- **The gender wage gap is dynamic**: women do not face a significant penalty at entry level, but the gap widens with experience. Each additional year of experience yields a 0.7% lower return for women compared to men.
+- **Union membership** carries a wage premium of about 20%.
+- **Ethnicity** effects are weak and not always significant, though workers in the "other" category show a mild wage penalty.
+
+Model comparison via AIC and BIC consistently selected *fit3* as the best specification, balancing fit and complexity. Residual diagnostics confirmed that the OLS assumptions are reasonably satisfied, with only mild heteroscedasticity detected.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
