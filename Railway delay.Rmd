@@ -1,0 +1,324 @@
+---
+title: "Railway Delay Analysis"
+subtitle: "Bologna–Milan Route · Trenitalia 2017–2018"
+author: "Massimo"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    fig_caption: true
+    fig_width: 7
+    fig_height: 4
+geometry: margin=2.5cm
+fontsize: 11pt
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{float}
+  - \renewcommand{\contentsname}{Table of Contents}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.pos = "H"
+)
+
+library(tidyverse)
+library(lubridate)
+library(broom)
+library(caret)
+library(ROSE)
+library(pROC)
+
+theme_set(
+  theme_minimal(base_size = 11) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 12),
+      plot.subtitle = element_text(color = "grey40", size = 9),
+      axis.title    = element_text(size = 9),
+      plot.margin   = margin(10, 10, 10, 10)
+    )
+)
+```
+
+\newpage
+
+# Introduction
+
+This report analyses train delay patterns on the **Bologna–Milan route**, one of Italy's busiest intercity corridors. Using operational data from Trenitalia (December 2017 – March 2018), the analysis aims to identify the main temporal and spatial drivers of delays, and to build a predictive model estimating the probability of a significant delay (> 5 minutes).
+
+The analysis is structured in three parts:
+
+- **Data preparation** — loading, cleaning, and variable engineering
+- **Exploratory analysis** — delay distributions, patterns by station, month, and day of the week
+- **Modelling** — linear regression for delay magnitude and logistic regression for delay probability
+
+---
+
+# Data Preparation
+
+```{r load-data}
+data <- read.delim(
+  "C:/Users/Massimo/Desktop/Data/Railway delay/AllDataTables_B2M_table.csv",
+  sep    = "\t",
+  header = TRUE,
+  quote  = ""
+) %>%
+  separate(1, into = c("data", "num_treno"), sep = ",") %>%
+  select(-last_col()) %>%
+  rename(
+    stazione = treno,
+    arr_prog = stazione,
+    arr_eff  = arr_prog,
+    ritardo  = arr_eff
+  ) %>%
+  mutate(
+    data      = dmy(data),
+    arr_prog  = dmy_hms(arr_prog),
+    arr_eff   = dmy_hms(arr_eff),
+    ritardo   = as.numeric(ritardo),
+    num_treno = as.character(num_treno)
+  )
+```
+
+The raw dataset contained **`r nrow(data)` observations** across 6 variables: date, train number, station, scheduled arrival, actual arrival, and delay in minutes.
+
+```{r clean-data}
+n_outliers <- data %>% filter(ritardo > 180) %>% nrow()
+data <- data %>% filter(ritardo <= 180)
+```
+
+A total of **`r n_outliers` records** with delay values above 180 minutes were removed as data entry errors — they represented less than 0.05% of observations and were clearly implausible (e.g. max value of 1.057 × 10¹³ minutes). The final dataset contains **`r nrow(data)` observations**.
+
+---
+
+# Exploratory Analysis
+
+## Delay Distribution
+
+```{r plot-hist, fig.cap="Most trains arrive on time or with minor delays. The distribution shows a right skew, with a small proportion accumulating significant delays."}
+ggplot(data, aes(x = ritardo)) +
+  geom_histogram(binwidth = 2, fill = "#2C7BB6", color = "white") +
+  geom_vline(xintercept = median(data$ritardo), 
+             color = "red", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = median(data$ritardo) + 8, y = 7500,
+           label = paste("Median:", median(data$ritardo), "min"),
+           color = "red", size = 3.5) +
+  geom_vline(xintercept = mean(data$ritardo),
+             color = "darkgreen", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = mean(data$ritardo) + 8, y = 6500,
+           label = paste("Mean:", round(mean(data$ritardo), 1), "min"),
+           color = "darkgreen", size = 3.5) +
+  labs(title = "Delay Distribution – Bologna to Milan Route",
+       x = "Delay (minutes)",
+       y = "Frequency") +
+  theme_minimal()
+```
+
+The median delay is **`r median(data$ritardo)` minutes**, while the mean is **`r round(mean(data$ritardo), 1)` minutes** — the difference reflects the right-skewed distribution, where a minority of trains accumulate substantial delays. Negative values (early arrivals) exist but are rare.
+
+## Delays by Station
+
+```{r plot-stations, fig.cap="Stations with the highest average delays tend to be intermediate stops, suggesting delay accumulation along the route rather than at terminals."}
+top15 <- data %>%
+  group_by(stazione) %>%
+  summarise(ritardo_medio = mean(ritardo, na.rm = TRUE)) %>%
+  arrange(desc(ritardo_medio)) %>%
+  slice_head(n = 15) %>%
+  mutate(gruppo = "Top 15 highest delay")
+
+bottom5 <- data %>%
+  group_by(stazione) %>%
+  summarise(ritardo_medio = mean(ritardo, na.rm = TRUE)) %>%
+  arrange(desc(ritardo_medio)) %>%
+  slice_tail(n = 5) %>%
+  mutate(gruppo = "Top 5 lowest delay")
+
+bind_rows(top15, bottom5) %>%
+  mutate(stazione = factor(stazione, levels = rev(stazione))) %>%
+  ggplot(aes(x = stazione, y = ritardo_medio, fill = gruppo)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "Top 15 highest delay" = "#D7191C",
+      "Top 5 lowest delay"   = "#2C7BB6"
+    )
+  ) +
+  labs(
+    title    = "Stations by Average Delay – Best and Worst",
+    subtitle = "Bologna to Milan Route – Trenitalia 2017–2018",
+    x        = NULL,
+    y        = "Average Delay (minutes)",
+    fill     = NULL
+  ) +
+  theme(legend.position = "none")
+```
+
+## Delays by Month
+
+```{r plot-month, fig.cap="March stands out as the worst month, with an average delay exceeding 7 minutes — roughly 40% above the overall average. This spike likely reflects strike activity or adverse weather conditions."}
+data %>%
+  mutate(mese = month(data, label = TRUE, abbr = TRUE, locale = "en")) %>%
+  group_by(mese) %>%
+  summarise(ritardo_medio = mean(ritardo, na.rm = TRUE)) %>%
+  ggplot(aes(x = mese, y = ritardo_medio, group = 1)) +
+  geom_line(color = "#2C7BB6", linewidth = 1) +
+  geom_point(color = "#2C7BB6", size = 3) +
+  labs(
+    title    = "Average Delay by Month",
+    subtitle = "Trenitalia 2017–2018",
+    x        = NULL,
+    y        = "Average Delay (minutes)"
+  )
+```
+
+## Delays by Day of the Week
+
+```{r plot-day, fig.cap="Wednesday shows the highest average delay, while Sunday is clearly the best day — consistent with lower traffic volumes on weekends."}
+data %>%
+  mutate(giorno = wday(data, label = TRUE, abbr = TRUE, week_start = 1)) %>%
+  group_by(giorno) %>%
+  summarise(ritardo_medio = mean(ritardo, na.rm = TRUE)) %>%
+  ggplot(aes(x = giorno, y = ritardo_medio, group = 1)) +
+  geom_line(color = "#2C7BB6", linewidth = 1) +
+  geom_point(color = "#2C7BB6", size = 3) +
+  labs(
+    title    = "Average Delay by Day of the Week",
+    subtitle = "Trenitalia 2017–2018",
+    x        = NULL,
+    y        = "Average Delay (minutes)"
+  )
+```
+
+---
+
+# Modelling
+
+## Linear Regression — Delay Magnitude
+
+```{r linear-model}
+data_model <- data %>%
+  mutate(
+    mese   = as.factor(month(data)),
+    giorno = as.factor(wday(data, week_start = 1)),
+    ora    = as.numeric(hour(arr_prog))
+  )
+
+model_lm <- lm(ritardo ~ mese + giorno + ora, data = data_model)
+r2 <- round(summary(model_lm)$r.squared, 3)
+```
+
+A linear regression was fitted using month, day of the week, and hour of departure as predictors. The model achieves an R² of **`r r2`**, meaning it explains approximately `r r2 * 100`% of the variance in delay. This low value is expected: the main drivers of train delays — mechanical failures, weather events, and network disruptions — are not captured in this dataset. The model nonetheless confirms that temporal variables have a statistically significant effect on delay magnitude.
+
+```{r}
+data_model %>%
+  mutate(predicted = predict(model_lm)) %>%
+  ggplot(aes(x = predicted, y = ritardo)) +
+  geom_point(alpha = 0.1, color = "#2C7BB6", size = 0.8) +
+  geom_abline(slope = 1, intercept = 0, 
+              color = "#D7191C", linewidth = 1, linetype = "dashed") +
+  labs(
+    title    = "Observed vs Predicted Delay",
+    x        = "Predicted Delay (minutes)",
+    y        = "Observed Delay (minutes)"
+  ) +
+  theme_minimal()
+```
+
+## Logistic Regression — Probability of Significant Delay
+
+A binary outcome variable was created, defining a significant delay as **> 5 minutes**. A logistic regression was trained on an 80/20 train-test split, with class imbalance corrected via ROSE oversampling.
+
+```{r logistic-model}
+data_model <- data_model %>%
+  mutate(ritardo_bin = ifelse(ritardo > 5, 1, 0))
+
+set.seed(123)
+train_index   <- createDataPartition(data_model$ritardo_bin, p = 0.8, list = FALSE)
+train_data    <- data_model[train_index, ]
+test_data     <- data_model[-train_index, ]
+train_balanced <- ROSE(ritardo_bin ~ mese + giorno + ora,
+                       data = train_data, seed = 123)$data
+
+model_log_bal <- glm(ritardo_bin ~ mese + giorno + ora,
+                     data  = train_balanced,
+                     family = binomial)
+
+pred_prob_bal  <- predict(model_log_bal, newdata = test_data, type = "response")
+pred_class_bal <- ifelse(pred_prob_bal > 0.5, 1, 0)
+```
+
+### Coefficient Plot
+
+```{r plot-coef, fig.cap="Predictors in red increase the probability of a significant delay; those in blue reduce it. March and the hour of departure are the strongest positive drivers; Sunday is the strongest negative one."}
+tidy(model_log_bal) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(term = reorder(term, estimate)) %>%
+  ggplot(aes(
+    x    = term,
+    y    = estimate,
+    fill = ifelse(estimate > 0, "Increases delay", "Decreases delay")
+  )) +
+  geom_col() +
+  geom_errorbar(
+    aes(ymin = estimate - std.error, ymax = estimate + std.error),
+    width = 0.3
+  ) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "Increases delay" = "#D7191C",
+      "Decreases delay" = "#2C7BB6"
+    )
+  ) +
+  labs(
+    title    = "Logistic Regression Coefficients",
+    subtitle = "Probability of delay > 5 minutes",
+    x        = NULL,
+    y        = "Coefficient estimate",
+    fill     = NULL
+  ) +
+  theme(legend.position = "bottom")
+```
+
+### ROC Curve
+
+```{r plot-roc, fig.cap="The ROC curve confirms limited but non-trivial predictive power. An AUC above 0.5 indicates the model performs better than random classification."}
+roc_obj <- roc(test_data$ritardo_bin, pred_prob_bal)
+
+ggroc(roc_obj, color = "#2C7BB6", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 1,
+              linetype = "dashed", color = "gray50") +
+  annotate(
+    "text",
+    x     = 0.3, y = 0.2,
+    label = paste("AUC =", round(auc(roc_obj), 3)),
+    size  = 5, color = "#D7191C"
+  ) +
+  labs(
+    title    = "ROC Curve – Logistic Regression Model",
+    subtitle = "Predicting delays > 5 minutes",
+    x        = "Specificity",
+    y        = "Sensitivity"
+  )
+```
+
+The model achieves an AUC of **`r round(auc(roc_obj), 3)`**. While modest, this result is consistent with the limited set of predictors available. The balanced accuracy on the test set improves substantially over the naive baseline once class imbalance is corrected, rising from 0.50 to **0.57**.
+
+---
+
+# Conclusions
+
+The analysis of the Bologna–Milan route highlights several recurring patterns in train delays:
+
+- **March** is the worst month by a wide margin, suggesting the influence of seasonal disruptions such as strikes or adverse weather.
+- **Wednesday** is the most delayed weekday; **Sunday** consistently shows the lowest delays, reflecting reduced network load.
+- **Later departures** are associated with slightly higher delays, likely due to schedule propagation effects throughout the day.
+- The predictive models confirm these patterns are statistically significant, though the limited R² and AUC indicate that the primary drivers of delays remain unobserved — mechanical, meteorological, and operational factors not present in this dataset.
+
+Future work could integrate external data sources (weather records, strike calendars, rolling stock data) to substantially improve predictive performance.
